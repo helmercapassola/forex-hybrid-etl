@@ -1,0 +1,17 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+logs/
+data/*
+!.gitkeep
+!data/raw/
+data/raw/*
+!data/raw/.gitkeep
+!data/staging/
+data/staging/*
+!data/reports/
+data/reports/*
+!data/reports/.gitkeep
+airflow/logs/
+airflow/config/

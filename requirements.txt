@@ -1,0 +1,4 @@
+﻿websocket-client
+python-dotenv
+kafka-python
+psycopg[binary]>=3.2,<4
