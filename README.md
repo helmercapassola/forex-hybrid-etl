@@ -1,12 +1,28 @@
 # Forex Hybrid ETL
 
-Estou a construir este projeto para aprender e implementar um pipeline de dados
-Forex com a Tiingo. Combinei duas formas de ingestão: cotações em tempo real e
-velas históricas diárias, usando Python, Kafka, PostgreSQL e Apache Airflow.
+Pipeline de Engenharia de Dados para ingestão, processamento e análise de cotações cambiais, combinando streaming em tempo real e processamento batch.
 
-Neste momento, os dois fluxos estão implementados e testados localmente. O
-histórico é carregado diariamente, analisado no PostgreSQL e exportado para CSV.
-No fim deste README mantenho o ponto de situação e os próximos objetivos.
+## Visão geral
+
+O Forex Hybrid ETL é um projecto de portefólio que tem como objectivo desenvolver um pipeline de dados capaz de recolher cotações do mercado cambial, validar e transformar os dados e disponibilizá-los para análise.
+
+O projecto combina duas estratégias de ingestão:
+
+- Streaming: recepção contínua de cotações através de WebSocket.
+- Batch: recolha e processamento de dados históricos através de uma API REST.
+
+A implementação será desenvolvida progressivamente, com foco na qualidade dos dados, na automatização dos processos, na tolerância a falhas e na reprodutibilidade das execuções.
+
+## Objectivos
+
+- Implementar ingestão de dados cambiais em tempo real.
+- Desenvolver um processo batch para recolha de dados históricos.
+- Aplicar técnicas de validação, normalização e deduplicação.
+- Integrar Apache Kafka para processamento de eventos.
+- Utilizar PostgreSQL para persistência dos dados.
+- Orquestrar tarefas batch com Apache Airflow.
+- Criar transformações analíticas para estudar o comportamento do par EUR/USD.
+- Aplicar testes automatizados e boas práticas de desenvolvimento.
 
 ## Conteúdo
 
@@ -83,6 +99,8 @@ registos carregados pode ser inferior ao número de dias no intervalo.
 - Airflow 3.3.2 com `LocalExecutor` e duas DAGs: uma de aprendizagem e outra
   para a ingestão histórica diária.
 - View PostgreSQL `v_fx_daily_analysis` e migração SQL versionada.
+- View semanal `v_fx_weekly_ohlc`, que agrega as velas diárias por semana UTC.
+- View `v_fx_quote_spread` para calcular o spread de ticks que têm bid e ask.
 - Relatório CSV com contagem de velas e variações percentuais.
 - **38 testes unitários aprovados** na última execução.
 
@@ -172,6 +190,8 @@ Na primeira configuração, aplico os scripts à base `forex` pela seguinte orde
    cotações em tempo real.
 3. `sql/migrations/002_create_fx_daily_bars.sql` — tabela histórica.
 4. `sql/migrations/003_create_fx_daily_analysis_view.sql` — view analítica.
+5. `sql/migrations/004_create_fx_weekly_ohlc_view.sql` — agregação OHLC semanal.
+6. `sql/migrations/005_create_fx_quote_spread_view.sql` — spread das cotações.
 
 Mantenho os scripts SQL no repositório, mas ainda aplico as migrações
 manualmente no Query Tool do pgAdmin. A migração da view usa
@@ -250,6 +270,53 @@ WHERE source = 'tiingo'
 ORDER BY event_time;
 ```
 
+Para consultar as velas semanais agregadas:
+
+```sql
+SELECT
+    symbol,
+    week_start_utc,
+    first_bar_date_utc,
+    last_bar_date_utc,
+    open,
+    high,
+    low,
+    close,
+    daily_bar_count
+FROM v_fx_weekly_ohlc
+WHERE source = 'tiingo'
+  AND symbol = 'EURUSD'
+ORDER BY week_start_utc;
+```
+
+As semanas começam à segunda-feira, em UTC. A abertura é a abertura da primeira
+vela diária disponível; o máximo e o mínimo são os extremos da semana; o fecho
+é o fecho da última vela disponível. `daily_bar_count` permite ver quantas
+velas diárias entraram em cada agregado. Uma semana ainda em curso aparece como
+parcial.
+
+Para analisar o spread das cotações em tempo real:
+
+```sql
+SELECT
+    symbol,
+    event_time,
+    bid_price,
+    ask_price,
+    spread,
+    spread_pct_of_mid,
+    is_valid_spread
+FROM v_fx_quote_spread
+WHERE source = 'tiingo'
+  AND symbol = 'EURUSD'
+ORDER BY event_time;
+```
+
+O spread é `ask_price - bid_price`, expresso na mesma unidade dos preços; não o
+converto para pips porque a escala depende do par cambial. A view marca como
+inválido um spread sem bid/ask ou com ask inferior ao bid. Nesses casos, o
+spread calculado fica vazio, preservando a indicação da qualidade da cotação.
+
 ## Testes
 
 Executo os testes unitários a partir da raiz, com o ambiente virtual ativo:
@@ -289,6 +356,8 @@ requirements-lock.txt
 - [x] Extração histórica, staging, validação e UPSERT (`fx_daily_bars`).
 - [x] DAG manual e agendamento diário às 00:00 UTC, com janela móvel.
 - [x] Consulta analítica e view `v_fx_daily_analysis`.
+- [x] Agregação OHLC semanal em `v_fx_weekly_ohlc`.
+- [x] Cálculo do spread bid/ask em `v_fx_quote_spread`.
 - [x] Relatório CSV dependente da carga e guardado em `data/reports`.
 - [x] Testes unitários locais: 38 aprovados na última execução.
 
@@ -302,6 +371,7 @@ requirements-lock.txt
 
 ### Melhorias que quero desenvolver
 
+- [ ] Criar e validar agregações OHLC mensais.
 - [ ] Automatizar o controlo e a aplicação de migrações PostgreSQL.
 - [ ] Adicionar testes de integração da DAG, PostgreSQL e Kafka em ambiente
   descartável.
