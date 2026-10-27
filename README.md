@@ -1,18 +1,17 @@
 # Forex Hybrid ETL
 
-Pipeline de engenharia de dados para cotações Forex da Tiingo. O projeto combina
-ingestão em tempo real com uma carga histórica diária, usando Kafka, PostgreSQL,
-Python e Apache Airflow.
+Estou a construir este projeto para aprender e implementar um pipeline de dados
+Forex com a Tiingo. Combinei duas formas de ingestão: cotações em tempo real e
+velas históricas diárias, usando Python, Kafka, PostgreSQL e Apache Airflow.
 
-> **Estado:** a ingestão histórica, a execução diária no Airflow,
-> a análise SQL e a geração de um relatório CSV foram executadas e verificadas
-> localmente. Consulte [Acompanhamento do projeto](#acompanhamento-do-projeto)
-> para o estado atual e as tarefas ainda pendentes antes da publicação no GitHub.
+Neste momento, os dois fluxos estão implementados e testados localmente. O
+histórico é carregado diariamente, analisado no PostgreSQL e exportado para CSV.
+No fim deste README mantenho o ponto de situação e os próximos objetivos.
 
 ## Conteúdo
 
 - [Arquitetura](#arquitetura)
-- [O que já está implementado](#o-que-já-está-implementado)
+- [O que já construí](#o-que-já-construí)
 - [Tecnologias e portas](#tecnologias-e-portas)
 - [Pré-requisitos](#pré-requisitos)
 - [Configuração local](#configuração-local)
@@ -22,58 +21,70 @@ Python e Apache Airflow.
 - [Relatórios](#relatórios)
 - [Testes](#testes)
 - [Estrutura do projeto](#estrutura-do-projeto)
-- [Segurança e publicação no GitHub](#segurança-e-publicação-no-github)
 - [Acompanhamento do projeto](#acompanhamento-do-projeto)
 
 ## Arquitetura
 
-```text
-Tempo real:
-Tiingo Forex WebSocket -> produtor Python -> Kafka -> consumidor Python
-                                                        |
-                                                        v
-                                               PostgreSQL / fx_quotes
+```mermaid
+flowchart LR
+    subgraph realtime["Cotações em tempo real"]
+        direction LR
+        ws["Tiingo FX WebSocket"] --> producer["Produtor Python"]
+        producer --> kafka[("Kafka<br/>forex-quotes")]
+        kafka --> consumer["Consumidor Python"]
+        consumer --> quotes[("PostgreSQL<br/>fx_quotes")]
+    end
 
-Histórico diário:
-Tiingo Historical API -> Airflow: extract -> prepare -> validate -> load
-                                                               |
-                                                               v
-                                                   PostgreSQL / fx_daily_bars
-                                                               |
-                                                               v
-                                                   relatório CSV / data/reports
+    subgraph historical["Cotações históricas diárias"]
+        direction LR
+        api["Tiingo Historical API"] --> extract["Airflow<br/>Extract"]
+        extract --> prepare["Prepare"]
+        prepare --> validate["Validate"]
+        validate --> load["Load"]
+        load --> bars[("PostgreSQL<br/>fx_daily_bars")]
+        bars --> report["Relatório CSV<br/>data/reports"]
+    end
 ```
 
-O PostgreSQL contém duas tabelas separadas:
+Separei os dados em duas tabelas: `fx_quotes` guarda os ticks em tempo real e
+`fx_daily_bars` guarda as velas históricas OHLC. A base `airflow` é usada apenas
+para os metadados do orquestrador; os dados Forex ficam na base `forex`.
 
-- `fx_quotes`: ticks recebidos pelo fluxo em tempo real.
-- `fx_daily_bars`: velas históricas diárias OHLC.
+### Fluxo em tempo real
 
-O Airflow usa uma base de metadados chamada `airflow`; os dados Forex ficam na
-base `forex`. Não confundir as duas bases ao ligar o pgAdmin.
+O produtor recebe mensagens do WebSocket da Tiingo, normaliza as cotações e
+publica-as no tópico `forex-quotes`. O consumidor valida cada mensagem e grava
+os dados no PostgreSQL antes de confirmar o respetivo offset no Kafka.
 
-## O que já está implementado
+### Fluxo histórico
+
+A DAG `tiingo_fx_historical` extrai as velas, guarda a resposta original,
+prepara e valida um CSV de staging, carrega os dados com UPSERT e cria um
+relatório resumido. Está agendada diariamente para as 00:00 UTC. Por
+predefinição, consulta os três dias completos anteriores; numa execução manual,
+posso indicar as duas datas do intervalo.
+
+Também criei a DAG tutorial `airflow_primeira_dag` para aprender a acompanhar
+execuções e tarefas pela interface do Airflow.
+
+Tiingo pode não devolver uma vela para cada dia pedido. Por isso, o número de
+registos carregados pode ser inferior ao número de dias no intervalo.
+
+## O que já construí
 
 - Produtor WebSocket Tiingo que normaliza cotações e publica no tópico Kafka
   `forex-quotes`.
 - Consumidor Kafka com validação, persistência idempotente em `fx_quotes` e
   confirmação do offset somente depois do processamento.
 - Extração de velas históricas Tiingo, preservação da resposta JSON bruta e
-  preparação/validação de CSV de staging.
+  preparação e validação de CSV de staging.
 - Carga histórica com UPSERT em `fx_daily_bars`, pela chave
   `(source, symbol, event_time)`.
-- Airflow 3.3.2 com `LocalExecutor` e a DAG tutorial `airflow_primeira_dag`.
-- DAG `tiingo_fx_historical`: extração, preparação, validação, carga e geração
-  do resumo CSV. Está configurada para executar diariamente às 00:00 UTC, sem
-  catchup. A janela automática cobre os três dias completos anteriores; numa
-  execução manual, também é possível indicar ambas as datas.
-- View PostgreSQL `v_fx_daily_analysis` e migração SQL versionada para a criar.
-- Relatório CSV de resumo com contagem de velas e variações percentuais.
-- Testes unitários locais: **38 aprovados** na última verificação registada.
-
-Tiingo pode não devolver uma vela para todos os dias do intervalo pedido. Fins
-de semana e disponibilidade da fonte explicam intervalos com menos registos;
-validar a contagem real é parte do fluxo.
+- Airflow 3.3.2 com `LocalExecutor` e duas DAGs: uma de aprendizagem e outra
+  para a ingestão histórica diária.
+- View PostgreSQL `v_fx_daily_analysis` e migração SQL versionada.
+- Relatório CSV com contagem de velas e variações percentuais.
+- **38 testes unitários aprovados** na última execução.
 
 ## Tecnologias e portas
 
@@ -85,34 +96,33 @@ validar a contagem real é parte do fluxo.
 | Airflow | `apache/airflow:3.3.2` | `http://localhost:8081` |
 | Python | ambiente local do projeto | 3.11 recomendado |
 
-O pgAdmin é um cliente desktop: para esta máquina, ligue-se ao host
-`127.0.0.1`, porta `5433`, base `forex`, utilizador definido por
-`POSTGRES_USER` e palavra-passe definida localmente por `POSTGRES_PASSWORD`.
-Dentro da rede Docker, os containers usam o host `postgres` e a porta `5432`.
+Para ligar o pgAdmin ao PostgreSQL local, uso host `127.0.0.1`, porta `5433` e
+base `forex`. Dentro da rede Docker, os containers usam o host `postgres` e a
+porta `5432`. A base `airflow` guarda os metadados do Airflow, não as cotações.
 
 ## Pré-requisitos
 
-- Windows com Docker Desktop e Docker Compose disponíveis no PowerShell.
+- Windows com Docker Desktop e Docker Compose.
 - Python 3.11 para executar os testes e os processos de tempo real no host.
-- Uma conta/token Tiingo com acesso aos produtos Forex que pretende usar.
+- Uma conta Tiingo com token e acesso aos produtos Forex que pretendo usar.
 - Opcional: pgAdmin ou outro cliente PostgreSQL.
 
 ## Configuração local
 
-1. Obtenha uma cópia do repositório e abra o PowerShell na pasta do projeto.
-2. Crie o ficheiro local de variáveis de ambiente:
+1. Clono o repositório e abro o PowerShell na pasta do projeto.
+2. Crio o ficheiro local de variáveis de ambiente:
 
    ```powershell
    Copy-Item .env.example .env
    notepad .env
    ```
 
-3. Preencha `TIINGO_API_TOKEN` e crie valores privados para `POSTGRES_PASSWORD`,
-   `AIRFLOW_FERNET_KEY` e `AIRFLOW_JWT_SECRET`. Defina também uma palavra-passe
-   administrativa em `AIRFLOW_ADMIN_PASSWORD`. Não partilhe nem faça commit do
-   `.env`.
+3. Preencho `TIINGO_API_TOKEN` e defino valores locais para
+   `POSTGRES_PASSWORD`, `AIRFLOW_FERNET_KEY`, `AIRFLOW_JWT_SECRET` e
+   `AIRFLOW_ADMIN_PASSWORD`. O ficheiro `.env` contém a configuração da minha
+   máquina e está excluído do Git.
 
-   Para gerar os segredos Airflow com a imagem já usada pelo projeto:
+   Para gerar as chaves Airflow com a imagem usada pelo projeto:
 
    ```powershell
    docker run --rm apache/airflow:3.3.2 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
@@ -120,10 +130,10 @@ Dentro da rede Docker, os containers usam o host `postgres` e a porta `5432`.
    ```
 
    O primeiro comando gera `AIRFLOW_FERNET_KEY`; o segundo gera
-   `AIRFLOW_JWT_SECRET`. Use uma palavra-passe forte, privada e exclusiva para
-   PostgreSQL e outra para o utilizador administrador.
+   `AIRFLOW_JWT_SECRET`. Defino palavras-passe diferentes para PostgreSQL e
+   para o utilizador administrador do Airflow.
 
-4. Crie e ative o ambiente Python:
+4. Crio e ativo o ambiente Python:
 
    ```powershell
    python -m venv .venv
@@ -132,13 +142,13 @@ Dentro da rede Docker, os containers usam o host `postgres` e a porta `5432`.
    pip install -r requirements.txt
    ```
 
-5. Valide o Compose sem imprimir a configuração expandida:
+5. Valido a configuração do Compose:
 
    ```powershell
    docker compose config --quiet
    ```
 
-6. Inicie os serviços Docker:
+6. Inicio os serviços Docker:
 
    ```powershell
    docker compose up airflow-init
@@ -146,18 +156,16 @@ Dentro da rede Docker, os containers usam o host `postgres` e a porta `5432`.
    docker compose ps
    ```
 
-   Aguarde o PostgreSQL ficar `healthy` e confirme que os serviços Airflow estão
-   ativos. A interface do Airflow fica em `http://localhost:8081`. O utilizador
-   e a palavra-passe são os valores locais de `AIRFLOW_ADMIN_USERNAME` e
-   `AIRFLOW_ADMIN_PASSWORD`.
+   Espero até o PostgreSQL ficar `healthy` e os serviços Airflow estarem ativos.
+   A interface do Airflow fica em `http://localhost:8081`; uso os valores locais
+   de `AIRFLOW_ADMIN_USERNAME` e `AIRFLOW_ADMIN_PASSWORD` para entrar.
 
-O exemplo de ambiente contém nomes de variáveis e valores vazios para segredos;
-é necessário preenchê-los no `.env` local antes de iniciar os serviços.
+O ficheiro `.env.example` contém os nomes das variáveis necessários. Antes de
+iniciar os serviços, preencho os valores no meu `.env` local.
 
 ## Base de dados e migrações
 
-Na primeira configuração, crie/aplique os scripts na base `forex`, por esta
-ordem:
+Na primeira configuração, aplico os scripts à base `forex` pela seguinte ordem:
 
 1. `sql/schema.sql` — tabela de cotações em tempo real `fx_quotes`.
 2. `sql/migrations/001_add_quote_price_fields.sql` — colunas tipadas das
@@ -165,15 +173,15 @@ ordem:
 3. `sql/migrations/002_create_fx_daily_bars.sql` — tabela histórica.
 4. `sql/migrations/003_create_fx_daily_analysis_view.sql` — view analítica.
 
-Os scripts SQL são versionados, mas ainda não existe um mecanismo automático de
-controlo/aplicação de migrações; aplique-os conscientemente no Query Tool do
-pgAdmin, ligado à base `forex`. A migração da view usa `CREATE OR REPLACE VIEW` e
-pode ser executada novamente para atualizar a definição.
+Mantenho os scripts SQL no repositório, mas ainda aplico as migrações
+manualmente no Query Tool do pgAdmin. A migração da view usa
+`CREATE OR REPLACE VIEW` e pode ser executada novamente para atualizar a sua
+definição.
 
 ## Executar o pipeline em tempo real
 
-Com Kafka e PostgreSQL ativos, abra **dois terminais PowerShell** na raiz do
-projeto, ative o ambiente `.venv` em ambos e execute:
+Com Kafka e PostgreSQL ativos, abro **dois terminais PowerShell** na raiz do
+projeto, ativo o ambiente `.venv` em ambos e executo:
 
 Terminal 1 — consumidor:
 
@@ -188,23 +196,23 @@ python -m src.producers.tiingo_ws_producer
 ```
 
 O produtor lê `TIINGO_API_TOKEN` e `FOREX_SYMBOL` do ambiente. O consumidor
-valida as mensagens Kafka e grava as cotações em `fx_quotes`. Para parar cada
-processo, use `Ctrl+C`.
+valida as mensagens Kafka e grava as cotações em `fx_quotes`. Para parar os
+processos, uso `Ctrl+C`.
 
 ## Airflow e histórico diário
 
-Abra `http://localhost:8081`, entre com as credenciais administrativas locais e
-procure `tiingo_fx_historical`. Na primeira utilização, confirme que a DAG está
-ativa. Pode acionar uma execução pela interface ou aguardar o horário diário.
+Abro `http://localhost:8081`, entro com as credenciais administrativas locais e
+procuro `tiingo_fx_historical`. Pela interface, posso acionar uma execução
+manual ou acompanhar o agendamento diário.
 
 Parâmetros de execução manual:
 
 - `symbol`: símbolo de seis letras, predefinido como `EURUSD`.
-- `start_date` e `end_date`: preencha **ambos** no formato `AAAA-MM-DD` para
-  escolher um intervalo inclusivo. Se ambos ficarem vazios, a DAG usa a janela
-  automática de três dias completos anteriores.
+- `start_date` e `end_date`: preencho **ambos** no formato `AAAA-MM-DD` para
+  escolher um intervalo inclusivo. Se deixar ambos vazios, a DAG usa a janela
+  automática dos três dias completos anteriores.
 
-As tarefas são executadas nesta ordem:
+As tarefas correm nesta ordem:
 
 1. `extract`: consulta a API histórica Tiingo e guarda JSON em `data/raw`.
 2. `prepare`: converte a resposta em CSV canónico em `data/staging`.
@@ -213,9 +221,9 @@ As tarefas são executadas nesta ordem:
 5. `generate_report`: consulta o PostgreSQL e escreve o relatório CSV em
    `data/reports`; só corre depois de a carga ter sucesso.
 
-Os ficheiros usam nomes com timestamp para não sobrescrever execuções
-anteriores. As pastas `data/raw`, `data/staging` e `data/reports` não devem ser
-publicadas com dados reais.
+Os ficheiros usam nomes com timestamp para preservar os resultados de cada
+execução. Mantenho os dados gerados localmente nas pastas `data/raw`,
+`data/staging` e `data/reports`.
 
 ## Relatórios
 
@@ -224,7 +232,7 @@ símbolo, as datas pedidas e disponíveis, o número de velas, o número de
 comparações com fecho anterior e as variações média, mínima e máxima em
 percentagem.
 
-Também é possível consultar os dados no pgAdmin. Exemplo de leitura da view:
+Também consulto a view analítica no pgAdmin:
 
 ```sql
 SELECT
@@ -244,53 +252,37 @@ ORDER BY event_time;
 
 ## Testes
 
-Execute os testes unitários a partir da raiz, com o ambiente virtual ativo:
+Executo os testes unitários a partir da raiz, com o ambiente virtual ativo:
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
 
-Os testes cobrem normalização, validação do consumidor/produtor, extração
-histórica, staging, carga e geração do relatório. A última execução registada
-teve **38 testes aprovados**. Ainda falta configurar execução automática destes
-testes no GitHub Actions.
+Os testes cobrem normalização, validação do produtor e consumidor, extração
+histórica, staging, carga e geração do relatório. Na última execução, os
+**38 testes passaram**. Ainda quero configurar a execução automática dos testes
+no GitHub Actions.
 
 ## Estrutura do projeto
 
 ```text
 airflow/dags/       DAG tutorial e DAG histórica
-data/raw/           respostas JSON da API (dados locais)
-data/staging/       CSVs intermédios (dados locais)
-data/reports/       relatórios CSV (dados locais)
-scripts/            scripts auxiliares, quando aplicável
+data/raw/           respostas JSON da API (ficheiros locais)
+data/staging/       CSVs intermédios (ficheiros locais)
+data/reports/       relatórios CSV (ficheiros locais)
 sql/                schema e migrações PostgreSQL
 src/                produtor, consumidor, extractores, staging, loaders e reports
 tests/              testes unitários
 docker-compose.yml  Kafka, PostgreSQL e Airflow
-.env.example        modelo sem segredos para configuração local
+.env.example        modelo de variáveis para configuração local
 requirements.txt    dependências Python da aplicação
 requirements-lock.txt
-                    lock atual a rever antes de ser usado como instalação
+                    lock atual a rever antes de usar numa instalação limpa
 ```
-
-## Segurança e publicação no GitHub
-
-- Nunca publique `.env`, tokens Tiingo, passwords, chaves Airflow, logs ou dados
-  recebidos da API.
-- `.gitignore` exclui `.env`, logs e o conteúdo de `data/`, mantendo apenas
-  ficheiros `.gitkeep` para as pastas de dados.
-- Antes do primeiro push, confirme `git status`, reveja cada ficheiro staged e
-  execute um scanner de segredos. Se uma credencial for exposta, revogue-a e
-  gere uma nova; apagar o valor do último commit não remove o segredo do
-  histórico Git.
-- Os serviços locais Kafka estão configurados sem autenticação/TLS. Não exponha
-  estas portas diretamente à Internet.
-- A configuração foi validada para aprendizagem e execução local, não é uma
-  implantação de produção.
 
 ## Acompanhamento do projeto
 
-### Concluído e verificado
+### O que já concluí
 
 - [x] Ambiente Docker com Kafka, PostgreSQL e Airflow local.
 - [x] Fluxo em tempo real Tiingo → Kafka → PostgreSQL (`fx_quotes`).
@@ -298,40 +290,21 @@ requirements-lock.txt
 - [x] DAG manual e agendamento diário às 00:00 UTC, com janela móvel.
 - [x] Consulta analítica e view `v_fx_daily_analysis`.
 - [x] Relatório CSV dependente da carga e guardado em `data/reports`.
-- [x] Testes unitários locais: 38 aprovados na última verificação.
-- [x] README inicial e lista de preparação para GitHub.
+- [x] Testes unitários locais: 38 aprovados na última execução.
 
-### Em falta antes de publicar
+### Próximos passos para publicar no GitHub
 
-- [ ] Fazer a revisão final dos ficheiros staged e uma análise de segredos;
-  confirmar que nenhum segredo ou dado real entra no Git. `.env.example` foi
-  revisto nesta etapa e não contém uma palavra-passe de exemplo.
-- [ ] Rever `requirements-lock.txt`: o conteúdo atual inclui pacotes de uma
-  instalação ampla e não é ainda um lock mínimo/reproduzível do projeto.
-- [ ] Executar novamente todos os testes num ambiente limpo e validar o Compose
-  usando apenas o `.env.example` preenchido localmente.
-- [ ] Adicionar GitHub Actions para executar testes e validações básicas em
-  pull requests.
-- [ ] Escolher e adicionar uma licença, se o repositório for público.
-- [ ] Criar/configurar o repositório remoto GitHub, escolher o nome/descrição e
-  definir a branch principal; rever o estado Git antes do primeiro commit/push.
-- [ ] Documentar política de retenção dos dados e estratégia de backup se o
-  ambiente passar a ser usado continuamente.
+- [ ] Rever as dependências e substituir `requirements-lock.txt` por um lock
+  reproduzível e limitado às dependências deste projeto.
+- [ ] Configurar GitHub Actions para executar os testes em cada pull request.
+- [ ] Escolher uma licença, caso decida tornar o repositório público.
+- [ ] Criar o repositório remoto e publicar a primeira versão.
 
-### Estado do Git local
-
-Na atualização deste README, a branch local era `master`, não havia remote
-GitHub configurado e os ficheiros do projeto ainda apareciam como não rastreados
-no Git. Não foi criado commit nem feito push. Antes do primeiro commit, reveja
-o conteúdo que será adicionado e confirme novamente `git status`.
-
-### Próximos objetivos técnicos
+### Melhorias que quero desenvolver
 
 - [ ] Automatizar o controlo e a aplicação de migrações PostgreSQL.
 - [ ] Adicionar testes de integração da DAG, PostgreSQL e Kafka em ambiente
   descartável.
 - [ ] Configurar alertas para falhas e monitorização das execuções agendadas.
-- [ ] Rever retries e alertas para `prepare`, `validate` e `generate_report`,
-  considerando quais falhas são realmente temporárias.
-- [ ] Avaliar autenticação e TLS antes de qualquer implantação fora da máquina
-  local.
+- [ ] Rever a política de retries das tarefas da DAG.
+- [ ] Preparar uma configuração para executar o projeto fora da máquina local.
