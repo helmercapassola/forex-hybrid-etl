@@ -107,6 +107,29 @@ class TestTiingoFxHistory(unittest.TestCase):
                 date(2026, 10, 27),
             )
 
+    @patch("src.extractors.tiingo_fx_history.urllib.request.urlopen")
+    def test_rejects_non_object_record_in_api_response(self, urlopen):
+        response = io.BytesIO(b'[{"date":"2026-10-27T00:00:00Z"}, null]')
+        urlopen.return_value.__enter__.return_value = response
+
+        with self.assertRaisesRegex(ValueError, "registos inválidos"):
+            fetch_historical_quotes(
+                "EURUSD",
+                date(2026, 10, 27),
+                date(2026, 10, 27),
+            )
+
+    @patch("src.extractors.tiingo_fx_history.urllib.request.urlopen")
+    def test_propagates_api_timeout(self, urlopen):
+        urlopen.side_effect = TimeoutError("API request timed out")
+
+        with self.assertRaisesRegex(TimeoutError, "timed out"):
+            fetch_historical_quotes(
+                "EURUSD",
+                date(2026, 10, 27),
+                date(2026, 10, 27),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -62,8 +62,8 @@ flowchart LR
     end
 ```
 
-Separei os dados em duas tabelas: `fx_quotes` guarda os ticks em tempo real e
-`fx_daily_bars` guarda as velas históricas OHLC. A base `airflow` é usada apenas
+Separação de dados em duas tabelas: `fx_quotes` guardar os ticks em tempo real e
+`fx_daily_bars` guardar as velas históricas OHLC. A base `airflow` é usada apenas
 para os metadados do orquestrador; os dados Forex ficam na base `forex`.
 
 ### Fluxo em tempo real
@@ -86,7 +86,7 @@ execuções e tarefas pela interface do Airflow.
 Tiingo pode não devolver uma vela para cada dia pedido. Por isso, o número de
 registos carregados pode ser inferior ao número de dias no intervalo.
 
-## O que já construí
+## O que já foi construído
 
 - Produtor WebSocket Tiingo que normaliza cotações e publica no tópico Kafka
   `forex-quotes`.
@@ -100,9 +100,10 @@ registos carregados pode ser inferior ao número de dias no intervalo.
   para a ingestão histórica diária.
 - View PostgreSQL `v_fx_daily_analysis` e migração SQL versionada.
 - View semanal `v_fx_weekly_ohlc`, que agrega as velas diárias por semana UTC.
+- View mensal `v_fx_monthly_ohlc`, que agrega as velas diárias por mês UTC.
 - View `v_fx_quote_spread` para calcular o spread de ticks que têm bid e ask.
 - Relatório CSV com contagem de velas e variações percentuais.
-- **38 testes unitários aprovados** na última execução.
+- **45 testes unitários aprovados** na última execução.
 
 ## Tecnologias e portas
 
@@ -192,11 +193,20 @@ Na primeira configuração, aplico os scripts à base `forex` pela seguinte orde
 4. `sql/migrations/003_create_fx_daily_analysis_view.sql` — view analítica.
 5. `sql/migrations/004_create_fx_weekly_ohlc_view.sql` — agregação OHLC semanal.
 6. `sql/migrations/005_create_fx_quote_spread_view.sql` — spread das cotações.
+7. `sql/migrations/006_create_fx_daily_returns_volatility_view.sql` — retornos e volatilidade.
+8. `sql/migrations/007_create_fx_monthly_ohlc_view.sql` — agregação OHLC mensal.
 
 Mantenho os scripts SQL no repositório, mas ainda aplico as migrações
 manualmente no Query Tool do pgAdmin. A migração da view usa
 `CREATE OR REPLACE VIEW` e pode ser executada novamente para atualizar a sua
 definição.
+
+Para repetir os controlos de qualidade, executo `sql/quality_checks.sql` no
+Query Tool ligado à base `forex`. O script apenas consulta as tabelas e devolve
+uma linha por verificação, com contagem de ocorrências e até dez exemplos. Os
+controlos OHLC, bid/ask e chaves duplicadas são apresentados como erros. As
+lacunas de calendário são apresentadas para revisão, porque fins de semana e
+feriados podem explicar a ausência de velas.
 
 ## Executar o pipeline em tempo real
 
@@ -295,6 +305,31 @@ vela diária disponível; o máximo e o mínimo são os extremos da semana; o fe
 velas diárias entraram em cada agregado. Uma semana ainda em curso aparece como
 parcial.
 
+Para consultar as velas mensais agregadas:
+
+```sql
+SELECT
+    symbol,
+    month_start_utc,
+    first_bar_date_utc,
+    last_bar_date_utc,
+    open,
+    high,
+    low,
+    close,
+    daily_bar_count
+FROM v_fx_monthly_ohlc
+WHERE source = 'tiingo'
+  AND symbol = 'EURUSD'
+ORDER BY month_start_utc;
+```
+
+O mês começa no primeiro dia do mês em UTC. A abertura é a abertura da primeira
+vela diária disponível; o máximo e o mínimo são os extremos das velas do mês; o
+fecho é o fecho da última vela disponível. `daily_bar_count` mostra quantas
+velas entraram no agregado. O mês atual representa apenas os dados disponíveis
+até ao momento.
+
 Para analisar o spread das cotações em tempo real:
 
 ```sql
@@ -317,6 +352,29 @@ converto para pips porque a escala depende do par cambial. A view marca como
 inválido um spread sem bid/ask ou com ask inferior ao bid. Nesses casos, o
 spread calculado fica vazio, preservando a indicação da qualidade da cotação.
 
+Para consultar os retornos diários e a volatilidade móvel:
+
+```sql
+SELECT
+    symbol,
+    data_utc,
+    close,
+    previous_close,
+    daily_return_pct,
+    returns_in_5_observation_window,
+    volatility_5_returns_pct
+FROM v_fx_daily_returns_volatility
+WHERE source = 'tiingo'
+  AND symbol = 'EURUSD'
+ORDER BY event_time;
+```
+
+O retorno diário compara o fecho com o fecho anterior. A volatilidade é o desvio
+padrão amostral dos últimos cinco retornos observados, expresso em pontos
+percentuais e sem anualização. Só é apresentado quando existem cinco retornos
+na janela; antes disso, fica vazio. Como esta demonstração contém poucas velas,
+é normal que a volatilidade apareça apenas na última linha.
+
 ## Testes
 
 Executo os testes unitários a partir da raiz, com o ambiente virtual ativo:
@@ -327,8 +385,49 @@ python -m unittest discover -s tests -v
 
 Os testes cobrem normalização, validação do produtor e consumidor, extração
 histórica, staging, carga e geração do relatório. Na última execução, os
-**38 testes passaram**. Ainda quero configurar a execução automática dos testes
-no GitHub Actions.
+**45 testes unitários passaram**. Também tenho testes de integração separados,
+que executam o carregador contra um PostgreSQL descartável.
+
+### Teste de integração PostgreSQL
+
+Também preparo um PostgreSQL isolado e descartável para testar o percurso
+JSON → staging CSV → carregador → base de dados. O teste não usa a base `forex`
+nem altera os dados do ambiente de desenvolvimento.
+
+Num terminal PowerShell, defino uma palavra-passe temporária para o container
+de teste e inicio apenas esse serviço:
+
+```powershell
+$env:POSTGRES_TEST_PASSWORD = [guid]::NewGuid().ToString("N")
+docker compose -p forex-integration-test -f docker-compose.integration.yml up -d
+```
+
+Depois indico ao teste os parâmetros desse PostgreSQL isolado e executo os
+testes de integração:
+
+```powershell
+$env:RUN_POSTGRES_INTEGRATION = "1"
+$env:TEST_POSTGRES_HOST = "127.0.0.1"
+$env:TEST_POSTGRES_PORT = "55432"
+$env:TEST_POSTGRES_DB = "forex_integration_test"
+$env:TEST_POSTGRES_USER = "forex_test"
+$env:TEST_POSTGRES_PASSWORD = $env:POSTGRES_TEST_PASSWORD
+python -m unittest discover -s tests\integration -v
+```
+
+Os quatro testes de integração verificam a persistência e o UPSERT ao
+reprocessar o mesmo CSV, a rejeição de OHLC inválido antes de gravar, a falha
+explícita quando o PostgreSQL não está disponível e a propagação de um erro
+HTTP 503 da API simulada localmente. Os testes recusam-se a executar operações
+de escrita se a base não se chamar exatamente `forex_integration_test`. Depois
+de terminar, removo o container e a base descartável:
+
+```powershell
+docker compose -p forex-integration-test -f docker-compose.integration.yml down
+```
+
+O serviço de teste não tem volume persistente. Se o terminal fechar antes da
+limpeza, executo o comando `down` acima no mesmo projeto Compose.
 
 ## Estrutura do projeto
 
@@ -340,7 +439,9 @@ data/reports/       relatórios CSV (ficheiros locais)
 sql/                schema e migrações PostgreSQL
 src/                produtor, consumidor, extractores, staging, loaders e reports
 tests/              testes unitários
+tests/integration/  testes com serviços isolados
 docker-compose.yml  Kafka, PostgreSQL e Airflow
+docker-compose.integration.yml PostgreSQL descartável para integração
 .env.example        modelo de variáveis para configuração local
 requirements.txt    dependências Python da aplicação
 requirements-lock.txt
@@ -349,7 +450,7 @@ requirements-lock.txt
 
 ## Acompanhamento do projeto
 
-### O que já concluí
+### Concluído
 
 - [x] Ambiente Docker com Kafka, PostgreSQL e Airflow local.
 - [x] Fluxo em tempo real Tiingo → Kafka → PostgreSQL (`fx_quotes`).
@@ -357,24 +458,33 @@ requirements-lock.txt
 - [x] DAG manual e agendamento diário às 00:00 UTC, com janela móvel.
 - [x] Consulta analítica e view `v_fx_daily_analysis`.
 - [x] Agregação OHLC semanal em `v_fx_weekly_ohlc`.
+- [x] Agregação OHLC mensal em `v_fx_monthly_ohlc`.
 - [x] Cálculo do spread bid/ask em `v_fx_quote_spread`.
+- [x] Retorno diário e volatilidade móvel de cinco retornos em
+  `v_fx_daily_returns_volatility`.
+- [x] Diagnóstico SQL reutilizável de preços, duplicações e lacunas em
+  `sql/quality_checks.sql`.
 - [x] Relatório CSV dependente da carga e guardado em `data/reports`.
-- [x] Testes unitários locais: 38 aprovados na última execução.
+- [x] Testes unitários locais: 45 aprovados na última execução.
+- [x] Testes de integração do fluxo histórico com PostgreSQL isolado: 2 aprovados.
 
-### Próximos passos para publicar no GitHub
+### Fase 8 — Testes e qualidade dos dados
 
-- [ ] Rever as dependências e substituir `requirements-lock.txt` por um lock
-  reproduzível e limitado às dependências deste projeto.
-- [ ] Configurar GitHub Actions para executar os testes em cada pull request.
-- [ ] Escolher uma licença, caso decida tornar o repositório público.
-- [ ] Criar o repositório remoto e publicar a primeira versão.
+- [x] Expandir testes unitários para fusos horários, timestamps equivalentes,
+  preços zero/negativos, resposta vazia e timeout da API.
+- [x] Criar testes de integração JSON → staging → PostgreSQL, isolados da base real.
+- [x] Verificar falhas controladas do PostgreSQL e da API histórica.
+- [ ] Integrar o percurso com Kafka e Airflow nos testes de ponta a ponta.
+- [x] Testar falhas controladas do PostgreSQL e da API histórica.
+- [ ] Validar consistência, completude e unicidade em diferentes intervalos.
+- [ ] Testar reexecução e recuperação da DAG após falha.
+- [ ] Documentar limites conhecidos e decisões técnicas.
 
-### Melhorias que quero desenvolver
+### Melhorias a desenvolver
 
-- [ ] Criar e validar agregações OHLC mensais.
+- [ ] Aplicar a análise OHLC mensal a outros símbolos e períodos.
 - [ ] Automatizar o controlo e a aplicação de migrações PostgreSQL.
-- [ ] Adicionar testes de integração da DAG, PostgreSQL e Kafka em ambiente
-  descartável.
+- [ ] Alargar os testes de integração para incluir Kafka e a execução da DAG.
 - [ ] Configurar alertas para falhas e monitorização das execuções agendadas.
 - [ ] Rever a política de retries das tarefas da DAG.
 - [ ] Preparar uma configuração para executar o projeto fora da máquina local.
