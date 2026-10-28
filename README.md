@@ -415,12 +415,16 @@ $env:TEST_POSTGRES_PASSWORD = $env:POSTGRES_TEST_PASSWORD
 python -m unittest discover -s tests\integration -v
 ```
 
-Os quatro testes de integração verificam a persistência e o UPSERT ao
-reprocessar o mesmo CSV, a rejeição de OHLC inválido antes de gravar, a falha
-explícita quando o PostgreSQL não está disponível e a propagação de um erro
-HTTP 503 da API simulada localmente. Os testes recusam-se a executar operações
-de escrita se a base não se chamar exatamente `forex_integration_test`. Depois
-de terminar, removo o container e a base descartável:
+Os cinco testes de integração verificam a persistência e o UPSERT ao
+reprocessar o mesmo CSV, a rejeição de OHLC inválido antes de gravar, a
+consistência, a completude e a unicidade em dois intervalos, a falha explícita
+quando o PostgreSQL não está disponível e a propagação de um erro HTTP 503 da
+API simulada localmente. A completude considera dias úteis de segunda a
+sexta-feira; como ainda não existe um calendário de feriados, lacunas nesses
+dias ficam sinalizadas para revisão, não são automaticamente classificadas
+como erro. Os testes recusam-se a executar operações de escrita se a base não
+se chamar exatamente `forex_integration_test`. Depois de terminar, removo o
+container e a base descartável:
 
 ```powershell
 docker compose -p forex-integration-test -f docker-compose.integration.yml down
@@ -428,6 +432,28 @@ docker compose -p forex-integration-test -f docker-compose.integration.yml down
 
 O serviço de teste não tem volume persistente. Se o terminal fechar antes da
 limpeza, executo o comando `down` acima no mesmo projeto Compose.
+
+### Teste de retry e recuperação da DAG
+
+Também testo a DAG `tiingo_fx_historical` no container Airflow, sem chamar a
+Tiingo nem escrever na base Forex. O teste substitui as funções das tarefas,
+simula uma falha transitória na primeira tentativa de carga e confirma que o
+retry conclui a execução sem repetir as tarefas anteriores nem o relatório.
+Os metadados desta execução ficam numa base SQLite temporária:
+
+```powershell
+docker compose run --rm --no-deps --entrypoint bash `
+  -e AIRFLOW_HOME=/tmp/airflow-recovery-test `
+  -e AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/dags `
+  -e AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////tmp/airflow-recovery-test/airflow.db `
+  -e AIRFLOW__LOGGING__LOGGING_LEVEL=ERROR `
+  airflow-scheduler `
+  -c "airflow db migrate && python -m unittest discover -s /opt/airflow/tests -v"
+```
+
+O comando cria um container de teste temporário e remove-o ao terminar. A
+primeira falha aparece no log de propósito; o resultado esperado são dois
+testes aprovados.
 
 ## Estrutura do projeto
 
@@ -440,6 +466,7 @@ sql/                schema e migrações PostgreSQL
 src/                produtor, consumidor, extractores, staging, loaders e reports
 tests/              testes unitários
 tests/integration/  testes com serviços isolados
+tests/airflow/      testes de retry e recuperação da DAG
 docker-compose.yml  Kafka, PostgreSQL e Airflow
 docker-compose.integration.yml PostgreSQL descartável para integração
 .env.example        modelo de variáveis para configuração local
@@ -466,7 +493,8 @@ requirements-lock.txt
   `sql/quality_checks.sql`.
 - [x] Relatório CSV dependente da carga e guardado em `data/reports`.
 - [x] Testes unitários locais: 45 aprovados na última execução.
-- [x] Testes de integração do fluxo histórico com PostgreSQL isolado: 2 aprovados.
+- [x] Testes de integração do fluxo histórico com PostgreSQL isolado: 5 aprovados.
+- [x] Testar retry e recuperação da DAG com metadados Airflow isolados.
 
 ### Fase 8 — Testes e qualidade dos dados
 
@@ -474,10 +502,9 @@ requirements-lock.txt
   preços zero/negativos, resposta vazia e timeout da API.
 - [x] Criar testes de integração JSON → staging → PostgreSQL, isolados da base real.
 - [x] Verificar falhas controladas do PostgreSQL e da API histórica.
+- [x] Validar OHLC, unicidade e dias úteis em intervalos completos e incompletos.
+- [x] Testar reexecução e recuperação da DAG após falha transitória.
 - [ ] Integrar o percurso com Kafka e Airflow nos testes de ponta a ponta.
-- [x] Testar falhas controladas do PostgreSQL e da API histórica.
-- [ ] Validar consistência, completude e unicidade em diferentes intervalos.
-- [ ] Testar reexecução e recuperação da DAG após falha.
 - [ ] Documentar limites conhecidos e decisões técnicas.
 
 ### Melhorias a desenvolver

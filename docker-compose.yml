@@ -131,6 +131,7 @@ services:
       - ./airflow/plugins:/opt/airflow/plugins
       - ./airflow/config:/opt/airflow/config
       - ./src:/opt/project/src:ro
+      - ./tests/airflow:/opt/airflow/tests:ro
       - ./data/raw:/opt/project/data/raw
       - ./data/staging:/opt/project/data/staging
       - ./data/reports:/opt/project/data/reports

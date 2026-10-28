@@ -147,6 +147,137 @@ class TestHistoricalPipelinePostgresIntegration(unittest.TestCase):
 
         self.assertEqual(row_count, 0)
 
+    def test_quality_checks_across_complete_and_incomplete_date_ranges(self):
+        complete_dates = [
+            date(2026, 10, day) for day in range(19, 24)
+        ]
+        incomplete_dates = [
+            date(2026, 10, day) for day in (26, 28, 30)
+        ]
+        records = [
+            (
+                "tiingo",
+                "EURUSD",
+                bar_date,
+                Decimal("1.1"),
+                Decimal("1.2"),
+                Decimal("1.0"),
+                Decimal("1.15"),
+            )
+            for bar_date in complete_dates + incomplete_dates
+        ]
+
+        with connect_database() as connection:
+            with connection.cursor() as cursor:
+                cursor.executemany(
+                    """
+                    INSERT INTO fx_daily_bars (
+                        source, symbol, event_time, open, high, low, close
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    records,
+                )
+
+            with self.assertRaises(psycopg.errors.UniqueViolation):
+                with connection.transaction():
+                    connection.execute(
+                        """
+                        INSERT INTO fx_daily_bars (
+                            source, symbol, event_time, open, high, low, close
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        records[0],
+                    )
+
+            with self.assertRaises(psycopg.errors.CheckViolation):
+                with connection.transaction():
+                    connection.execute(
+                        """
+                        INSERT INTO fx_daily_bars (
+                            source, symbol, event_time, open, high, low, close
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            "tiingo",
+                            "EURUSD",
+                            date(2026, 10, 24),
+                            Decimal("1.1"),
+                            Decimal("1.05"),
+                            Decimal("1.0"),
+                            Decimal("1.15"),
+                        ),
+                    )
+
+            def quality_for_range(start_date, end_date):
+                return connection.execute(
+                    """
+                    WITH expected_dates AS (
+                        SELECT generated_day::date AS bar_date
+                        FROM generate_series(
+                            %s::date,
+                            %s::date,
+                            INTERVAL '1 day'
+                        ) AS generated_day
+                        WHERE EXTRACT(ISODOW FROM generated_day) BETWEEN 1 AND 5
+                    ),
+                    bars AS (
+                        SELECT
+                            (event_time AT TIME ZONE 'UTC')::date AS bar_date,
+                            open,
+                            high,
+                            low,
+                            close
+                        FROM fx_daily_bars
+                        WHERE source = 'tiingo'
+                          AND symbol = 'EURUSD'
+                          AND (event_time AT TIME ZONE 'UTC')::date
+                              BETWEEN %s AND %s
+                    ),
+                    duplicate_keys AS (
+                        SELECT bar_date
+                        FROM bars
+                        GROUP BY bar_date
+                        HAVING COUNT(*) > 1
+                    )
+                    SELECT
+                        (SELECT COUNT(*) FROM expected_dates),
+                        (SELECT COUNT(DISTINCT bar_date) FROM bars),
+                        (
+                            SELECT COUNT(*)
+                            FROM expected_dates AS expected
+                            LEFT JOIN bars USING (bar_date)
+                            WHERE bars.bar_date IS NULL
+                        ),
+                        (
+                            SELECT COUNT(*)
+                            FROM bars
+                            WHERE open <= 0
+                               OR high <= 0
+                               OR low <= 0
+                               OR close <= 0
+                               OR high < GREATEST(open, close, low)
+                               OR low > LEAST(open, close, high)
+                        ),
+                        (SELECT COUNT(*) FROM duplicate_keys)
+                    """,
+                    (start_date, end_date, start_date, end_date),
+                ).fetchone()
+
+            complete_quality = quality_for_range(
+                date(2026, 10, 19),
+                date(2026, 10, 23),
+            )
+            incomplete_quality = quality_for_range(
+                date(2026, 10, 26),
+                date(2026, 10, 30),
+            )
+
+        self.assertEqual(complete_quality, (5, 5, 0, 0, 0))
+        self.assertEqual(incomplete_quality, (5, 3, 2, 0, 0))
+
     def test_postgres_unavailable_is_reported_without_success_fallback(self):
         valid_csv = (
             "source,symbol,event_time,open,high,low,close\n"
