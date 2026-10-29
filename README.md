@@ -35,6 +35,7 @@ A implementação será desenvolvida progressivamente, com foco na qualidade dos
 - [Executar o pipeline em tempo real](#executar-o-pipeline-em-tempo-real)
 - [Airflow e histórico diário](#airflow-e-histórico-diário)
 - [Relatórios](#relatórios)
+- [Decisões técnicas e limites conhecidos](#decisões-técnicas-e-limites-conhecidos)
 - [Testes](#testes)
 - [Estrutura do projeto](#estrutura-do-projeto)
 - [Acompanhamento do projeto](#acompanhamento-do-projeto)
@@ -375,6 +376,56 @@ percentuais e sem anualização. Só é apresentado quando existem cinco retorno
 na janela; antes disso, fica vazio. Como esta demonstração contém poucas velas,
 é normal que a volatilidade apareça apenas na última linha.
 
+## Decisões técnicas e limites conhecidos
+
+### Decisões técnicas
+
+- Separei os ticks em tempo real (`fx_quotes`) das velas históricas diárias
+  (`fx_daily_bars`), porque têm formatos, ritmos de chegada e chaves diferentes.
+- Trato os timestamps como instantes com fuso horário e uso UTC nas consultas
+  diárias, semanais e mensais. As semanas começam à segunda-feira.
+- Guardo a resposta histórica original em JSON e uso CSV como formato
+  intermédio de staging. No Airflow, o XCom transporta os caminhos dos ficheiros,
+  não o conteúdo completo dos dados.
+- Na tabela histórica, a chave `(source, symbol, event_time)` permite reexecutar
+  cargas: a mesma vela actualiza os valores existentes em vez de criar outra.
+- No fluxo realtime, gravo primeiro no PostgreSQL e só depois confirmo o offset
+  Kafka. A restrição de unicidade considera `(source, symbol, event_time,
+  raw_data)`, pelo que elimina a repetição da mesma mensagem, não necessariamente
+  ticks distintos com o mesmo timestamp.
+- As validações confirmam preços positivos e coerência OHLC antes da carga; as
+  restrições PostgreSQL também protegem esses valores na tabela histórica.
+- A volatilidade apresentada é o desvio padrão amostral dos últimos cinco
+  retornos observados, sem anualização. O spread permanece na unidade do preço,
+  sem conversão para pips.
+
+### Limites conhecidos
+
+- A integração depende da Tiingo e está centrada no símbolo EURUSD. Cobertura,
+  disponibilidade e dados devolvidos dependem da fonte; uma data pedida pode
+  não ter uma vela.
+- A verificação de completude conta dias de segunda a sexta-feira, mas não usa
+  um calendário cambial de feriados. As lacunas nesses dias são indicações para
+  revisão, não prova automática de dados em falta.
+- Os testes automatizados usam dados sintéticos e serviços locais. Não testam
+  uma ligação real ao WebSocket ou à API Tiingo.
+- O teste Kafka publica pelo callback do produtor e consome do broker isolado;
+  valida a mensagem com a função do consumidor e grava-a no PostgreSQL de teste.
+  Não inicia o processo contínuo do consumidor nem verifica nesse teste a
+  confirmação real do offset; esse comportamento tem cobertura unitária.
+- O teste Airflow de recuperação executa a DAG, mas substitui as funções de
+  extracção, staging, validação, carga e relatório. A integração histórica
+  JSON → staging → PostgreSQL é testada separadamente; ainda não há um teste
+  automatizado que execute a DAG completa contra a API e o PostgreSQL.
+- O Compose principal é local, com um broker Kafka e `LocalExecutor` no
+  Airflow. Não está preparado para alta disponibilidade nem para implantação
+  distribuída.
+- As migrações PostgreSQL são aplicadas manualmente; não há ainda um processo
+  automatizado de versionamento e aplicação no arranque.
+- A extração e a carga da DAG têm dois retries com intervalo de um minuto. As
+  restantes tarefas não têm retries explícitos, e ainda não há alertas
+  automáticos para falhas.
+
 ## Testes
 
 Executo os testes unitários a partir da raiz, com o ambiente virtual ativo:
@@ -415,7 +466,7 @@ $env:TEST_POSTGRES_PASSWORD = $env:POSTGRES_TEST_PASSWORD
 python -m unittest discover -s tests\integration -v
 ```
 
-Os cinco testes de integração verificam a persistência e o UPSERT ao
+Os cinco testes de integração históricos verificam a persistência e o UPSERT ao
 reprocessar o mesmo CSV, a rejeição de OHLC inválido antes de gravar, a
 consistência, a completude e a unicidade em dois intervalos, a falha explícita
 quando o PostgreSQL não está disponível e a propagação de um erro HTTP 503 da
@@ -432,6 +483,30 @@ docker compose -p forex-integration-test -f docker-compose.integration.yml down
 
 O serviço de teste não tem volume persistente. Se o terminal fechar antes da
 limpeza, executo o comando `down` acima no mesmo projeto Compose.
+
+### Teste do percurso realtime
+
+O Compose de integração também inicia um Kafka isolado, sem reutilizar o
+broker nem o tópico do ambiente principal. Com os serviços de teste ativos,
+defino o endereço do broker e corro os testes de integração:
+
+```powershell
+$env:KAFKA_TEST_BOOTSTRAP_SERVERS = "127.0.0.1:19092"
+python -m unittest discover -s tests\integration -v
+```
+
+O teste realtime publica uma cotação sintética pelo produtor, consome-a do
+tópico de teste, valida-a com o consumidor e guarda-a no PostgreSQL descartável.
+Confirma também que o UPSERT não cria duplicações. Não é feita qualquer chamada
+à Tiingo. Ao terminar os testes, removo o conjunto de serviços isolados:
+
+```powershell
+docker compose -p forex-integration-test -f docker-compose.integration.yml down
+```
+
+O percurso realtime e a DAG histórica são pipelines independentes. Por isso,
+verifico o Kafka com PostgreSQL no teste acima e a recuperação da DAG com o
+Airflow e metadados SQLite temporários, no comando seguinte.
 
 ### Teste de retry e recuperação da DAG
 
@@ -465,10 +540,10 @@ data/reports/       relatórios CSV (ficheiros locais)
 sql/                schema e migrações PostgreSQL
 src/                produtor, consumidor, extractores, staging, loaders e reports
 tests/              testes unitários
-tests/integration/  testes com serviços isolados
+tests/integration/  testes históricos e realtime com serviços isolados
 tests/airflow/      testes de retry e recuperação da DAG
 docker-compose.yml  Kafka, PostgreSQL e Airflow
-docker-compose.integration.yml PostgreSQL descartável para integração
+docker-compose.integration.yml Kafka e PostgreSQL descartáveis para integração
 .env.example        modelo de variáveis para configuração local
 requirements.txt    dependências Python da aplicação
 requirements-lock.txt
@@ -493,7 +568,7 @@ requirements-lock.txt
   `sql/quality_checks.sql`.
 - [x] Relatório CSV dependente da carga e guardado em `data/reports`.
 - [x] Testes unitários locais: 45 aprovados na última execução.
-- [x] Testes de integração do fluxo histórico com PostgreSQL isolado: 5 aprovados.
+- [x] Testes de integração: 6 aprovados (5 históricos e 1 realtime).
 - [x] Testar retry e recuperação da DAG com metadados Airflow isolados.
 
 ### Fase 8 — Testes e qualidade dos dados
@@ -504,14 +579,15 @@ requirements-lock.txt
 - [x] Verificar falhas controladas do PostgreSQL e da API histórica.
 - [x] Validar OHLC, unicidade e dias úteis em intervalos completos e incompletos.
 - [x] Testar reexecução e recuperação da DAG após falha transitória.
-- [ ] Integrar o percurso com Kafka e Airflow nos testes de ponta a ponta.
-- [ ] Documentar limites conhecidos e decisões técnicas.
+- [x] Validar separadamente o fluxo realtime com Kafka/PostgreSQL e os retries
+  da DAG no Airflow.
+- [x] Documentar limites conhecidos e decisões técnicas.
 
 ### Melhorias a desenvolver
 
 - [ ] Aplicar a análise OHLC mensal a outros símbolos e períodos.
 - [ ] Automatizar o controlo e a aplicação de migrações PostgreSQL.
-- [ ] Alargar os testes de integração para incluir Kafka e a execução da DAG.
+- [ ] Integrar a execução completa da DAG com os testes de carga e PostgreSQL.
 - [ ] Configurar alertas para falhas e monitorização das execuções agendadas.
 - [ ] Rever a política de retries das tarefas da DAG.
 - [ ] Preparar uma configuração para executar o projeto fora da máquina local.
